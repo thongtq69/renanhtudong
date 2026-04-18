@@ -42,7 +42,10 @@ const coverPreview = document.getElementById('cover-preview') as HTMLDivElement
 const savedConfig = JSON.parse(localStorage.getItem('app-config') || '{}')
 inputFolder.value = savedConfig.inputFolder || ''
 outputFolder.value = savedConfig.outputFolder || ''
-chromePath.value = savedConfig.chromePath || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+const isMac = /mac/i.test(navigator.userAgent)
+const defaultChromePath = isMac ? '' : 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+chromePath.value = savedConfig.chromePath ?? defaultChromePath
+if (isMac && chromePath.value && chromePath.value.includes('\\')) chromePath.value = ''
 userProfile.value = savedConfig.userProfile || ''
 promptTemplate.value = savedConfig.promptTemplate || 'Please generate a standard prompt code for this image including keywords: IMPORTANT, PRIMARY OBJECTIVE, ABSOLUTE CONSTRAINTS'
 waitUpload.value = savedConfig.waitTimeUpload || 5000
@@ -230,8 +233,8 @@ btnSavePrompt.addEventListener('click', async () => {
 btnStart.addEventListener('click', async () => {
   const config = saveConfig()
   
-  if (!config.inputFolder || !config.outputFolder || !config.chromePath) {
-    addLog('❌ Vui lòng cấu hình đầy đủ đường dẫn thư mục và Chrome!')
+  if (!config.inputFolder || !config.outputFolder) {
+    addLog('❌ Vui lòng chọn thư mục ảnh đầu vào và thư mục tải ảnh về!')
     return
   }
 

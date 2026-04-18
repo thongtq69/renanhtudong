@@ -320,6 +320,71 @@ const getErrorMessage = (err: unknown): string => {
   return err instanceof Error ? err.message : String(err)
 }
 
+// ========== BACKGROUND POPUP WATCHER ==========
+// Chạy song song suốt lifecycle tab, tự click nút "Đã hiểu"/"Got it" mỗi 1.5s
+function startPopupWatcher(page: Page, label: string, log: (msg: string) => void): () => void {
+  let stopped = false
+  const loop = async (): Promise<void> => {
+    while (!stopped && !shouldStop) {
+      try {
+        if (page.isClosed()) break
+        const clicked = await page.evaluate(() => {
+          const keywords = ['đã hiểu', 'got it', 'got it!', 'ok', 'ok!', 'understand', 'tôi hiểu']
+          const buttons = document.querySelectorAll('button, [role="button"]')
+          for (const el of Array.from(buttons)) {
+            const text = (el.textContent || '').trim().toLowerCase()
+            if (!text || text.length > 30) continue
+            if (!keywords.some(k => text === k || text.includes(k))) continue
+            const style = window.getComputedStyle(el as HTMLElement)
+            const rect = (el as HTMLElement).getBoundingClientRect()
+            if (rect.width > 0 && rect.height > 0 && style.display !== 'none' && parseFloat(style.opacity) > 0) {
+              ;(el as HTMLElement).click()
+              return text
+            }
+          }
+          return null
+        })
+        if (clicked) log(`⚠️ ${label}: auto-dismiss popup ("${clicked}")`)
+      } catch {}
+      await new Promise(r => setTimeout(r, 1500))
+    }
+  }
+  loop()
+  return () => { stopped = true }
+}
+
+// ========== CHỜ ĐẾN KHI KHÔNG CÒN POPUP ==========
+// Block trước mỗi bước input (upload/fill/send) để popup không cắt ngang
+async function ensureNoPopup(page: Page, maxWaitMs: number = 15000): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < maxWaitMs && !shouldStop) {
+    if (page.isClosed()) return
+    const hasPopup = await page.evaluate(() => {
+      const t = (document.body?.innerText || '').toLowerCase()
+      return t.includes('quá nhiều yêu cầu') || t.includes('too many requests') ||
+             t.includes('rate limit') || t.includes('limit exceeded')
+    }).catch(() => false)
+    if (!hasPopup) return
+    // Thử dismiss ngay
+    await page.evaluate(() => {
+      const keywords = ['đã hiểu', 'got it', 'got it!', 'ok', 'ok!', 'understand', 'tôi hiểu']
+      const buttons = document.querySelectorAll('button, [role="button"]')
+      for (const el of Array.from(buttons)) {
+        const text = (el.textContent || '').trim().toLowerCase()
+        if (!text || text.length > 30) continue
+        if (!keywords.some(k => text === k || text.includes(k))) continue
+        const style = window.getComputedStyle(el as HTMLElement)
+        const rect = (el as HTMLElement).getBoundingClientRect()
+        if (rect.width > 0 && rect.height > 0 && style.display !== 'none') {
+          ;(el as HTMLElement).click()
+          return
+        }
+      }
+    }).catch(() => {})
+    await page.waitForTimeout(800)
+  }
+}
+
 // ========== HÀM XỬ LÝ POPUP TỰ ĐỘNG ==========
 async function dismissPopup(page: Page, log: (msg: string) => void): Promise<boolean> {
   try {
@@ -327,8 +392,9 @@ async function dismissPopup(page: Page, log: (msg: string) => void): Promise<boo
     const hasPopup = await page.evaluate(() => {
       const text = document.body?.innerText?.toLowerCase() || ''
       const popups = [
-        'too many', 'rate limit', 'try again', 'limit exceeded', 
-        'please wait', 'got it', 'understand'
+        'too many', 'rate limit', 'try again', 'limit exceeded',
+        'please wait', 'got it', 'understand',
+        'quá nhiều yêu cầu', 'quá nhiều', 'thử lại sau', 'vui lòng đợi', 'đã hiểu', 'tôi hiểu'
       ]
       return popups.some(kw => text.includes(kw))
     })
@@ -440,7 +506,8 @@ async function waitForRateLimitPopup(
     // Kiểm tra popup rate limit
     const hasRateLimit = await page.evaluate(() => {
       const text = document.body?.innerText?.toLowerCase() || ''
-      return ['too many', 'rate limit', 'try again later', 'limit exceeded', 'please wait']
+      return ['too many', 'rate limit', 'try again later', 'limit exceeded', 'please wait',
+              'quá nhiều yêu cầu', 'quá nhiều', 'thử lại sau', 'vui lòng đợi', 'vui lòng chờ']
         .some(kw => text.includes(kw))
     })
 
@@ -450,7 +517,7 @@ async function waitForRateLimitPopup(
       // Thử click nhiều lần để tìm nút "Got it"
       for (let i = 0; i < 5; i++) {
         const clicked = await page.evaluate(() => {
-          const texts = ['got it', 'got it!', 'ok', 'ok!', 'đã hiểu', 'close']
+          const texts = ['got it', 'got it!', 'ok', 'ok!', 'đã hiểu', 'tôi hiểu', 'understand', 'close', 'đóng']
           const allElements = document.querySelectorAll('button, [role="button"]')
           
           for (const el of Array.from(allElements)) {
@@ -501,7 +568,8 @@ async function waitForPromptComplete(
     // Kiểm tra popup rate limit TRƯỚC
     const hasRateLimit = await page.evaluate(() => {
       const text = document.body?.innerText?.toLowerCase() || ''
-      return ['too many', 'rate limit', 'try again later', 'limit exceeded']
+      return ['too many', 'rate limit', 'try again later', 'limit exceeded',
+              'quá nhiều yêu cầu', 'quá nhiều', 'thử lại sau', 'vui lòng đợi']
         .some(kw => text.includes(kw))
     })
     
@@ -513,7 +581,7 @@ async function waitForPromptComplete(
       let gotItClicked = false
       for (let i = 0; i < 10; i++) {
         const clicked = await page.evaluate(() => {
-          const texts = ['got it', 'got it!', 'ok', 'ok!', 'understand']
+          const texts = ['got it', 'got it!', 'ok', 'ok!', 'understand', 'đã hiểu', 'tôi hiểu', 'đóng', 'close']
           const allElements = document.querySelectorAll('button, [role="button"]')
           
           for (const el of Array.from(allElements)) {
@@ -571,13 +639,28 @@ async function waitForPromptComplete(
       }
       
       if (currentText.length > 0 && currentText.length === lastTextLength) {
-        const hasCopyBtn = await lastMsg.locator('button:has-text("Copy"), [aria-label*="Copy"]').count() > 0
-        if (hasCopyBtn || currentText.includes('```')) {
+        // Nhận diện response đã xong bằng:
+        // 1) Có action buttons bên dưới (Copy/Sao chép, thumbs, share, regenerate)
+        // 2) Nút "Stop generating" đã biến mất
+        // 3) Text có ``` (code block)
+        // 4) Text đã stable nhiều chu kỳ (fallback)
+        const hasActionBtn = await lastMsg.locator(
+          'button:has-text("Copy"), [aria-label*="Copy" i], [aria-label*="Sao chép" i], ' +
+          '[aria-label*="thumbs" i], [aria-label*="thích" i], [aria-label*="chia sẻ" i], ' +
+          '[aria-label*="share" i], [aria-label*="regenerate" i], [aria-label*="tạo lại" i]'
+        ).count() > 0
+        const stopBtnCount = await page.locator(
+          'button[aria-label*="Stop" i], button[aria-label*="Dừng" i], button[data-testid="stop-button"]'
+        ).count()
+        const stillGenerating = stopBtnCount > 0
+        if (!stillGenerating && (hasActionBtn || currentText.includes('```') || stableCount >= 5)) {
           stableCount++
           if (stableCount >= 3) {
             log('✅ Prompt hoàn thành!')
             return true
           }
+        } else {
+          stableCount++
         }
       } else {
         lastTextLength = currentText.length
@@ -604,7 +687,8 @@ async function waitForImageReady(
     // Kiểm tra popup rate limit TRƯỚC
     const hasRateLimit = await page.evaluate(() => {
       const text = document.body?.innerText?.toLowerCase() || ''
-      return ['too many', 'rate limit', 'try again later', 'limit exceeded']
+      return ['too many', 'rate limit', 'try again later', 'limit exceeded',
+              'quá nhiều yêu cầu', 'quá nhiều', 'thử lại sau', 'vui lòng đợi']
         .some(kw => text.includes(kw))
     })
     
@@ -616,7 +700,7 @@ async function waitForImageReady(
       let gotItClicked = false
       for (let i = 0; i < 10; i++) {
         const clicked = await page.evaluate(() => {
-          const texts = ['got it', 'got it!', 'ok', 'ok!', 'understand']
+          const texts = ['got it', 'got it!', 'ok', 'ok!', 'understand', 'đã hiểu', 'tôi hiểu', 'đóng', 'close']
           const allElements = document.querySelectorAll('button, [role="button"]')
           
           for (const el of Array.from(allElements)) {
@@ -967,7 +1051,9 @@ async function processImageInBrowser(
   let context: BrowserContext | null = null
   let pageA: Page | null = null
   let pageB: Page | null = null
-  
+  let stopWatcherA: (() => void) | null = null
+  let stopWatcherB: (() => void) | null = null
+
   try {
     // ===== BƯỚC 1: TẠO BROWSER RIÊNG =====
     // Kích thước và vị trí cố định cho mỗi browser
@@ -994,7 +1080,7 @@ async function processImageInBrowser(
     
     // Sử dụng launchPersistentContext với profile cố định
     context = await chromium.launchPersistentContext(profileDir, {
-      executablePath: chromePath,
+      executablePath: chromePath && chromePath.trim() ? chromePath : undefined,
       headless: false,
       viewport: { width: browserWidth, height: browserHeight },
       ignoreDefaultArgs: ['--enable-automation'],
@@ -1010,8 +1096,12 @@ async function processImageInBrowser(
     // Tạo 2 tabs trong browser
     pageA = await context.newPage()
     pageB = await context.newPage()
-    
-    log(`🌐 Browser ${imageIndex + 1}: Đã mở browser với 2 tabs`)
+
+    // Khởi động popup watcher cho cả 2 tab — tự click "Đã hiểu"/"Got it" liên tục
+    stopWatcherA = startPopupWatcher(pageA, `Browser ${imageIndex + 1} Tab A`, log)
+    stopWatcherB = startPopupWatcher(pageB, `Browser ${imageIndex + 1} Tab B`, log)
+
+    log(`🌐 Browser ${imageIndex + 1}: Đã mở browser với 2 tabs + popup watcher`)
     
     // ===== BƯỚC 2: TAB A - UPLOAD + GỬI PROMPT =====
     log(`🌐 Browser ${imageIndex + 1}: Tab A - Mở ChatGPT...`)
@@ -1020,15 +1110,17 @@ async function processImageInBrowser(
     await dismissPopup(pageA, log)
     
     log(`📤 Browser ${imageIndex + 1}: Tab A - Upload ảnh...`)
+    await ensureNoPopup(pageA)
     const fileInputA = pageA.locator('input[type="file"]').first()
     await fileInputA.setInputFiles(imagePath)
     await pageA.waitForTimeout(waitTimeUpload)
-    
+
     log(`⌨️ Browser ${imageIndex + 1}: Tab A - Gửi prompt phân tích...`)
+    await ensureNoPopup(pageA)
     await pageA.locator('#prompt-textarea').fill(promptTemplate)
     await pageA.waitForTimeout(500)
-    await dismissPopup(pageA, log)
-    
+    await ensureNoPopup(pageA)
+
     const sendBtnA = pageA.locator('button[data-testid="send-button"], button[aria-label="Send prompt"]').first()
     await sendBtnA.click()
     
@@ -1060,41 +1152,93 @@ async function processImageInBrowser(
     await pageB.waitForSelector('#prompt-textarea', { timeout: 30000 })
     await dismissPopup(pageB, log)
     
-    // Chọn chế độ Create Image
+    // Chọn chế độ Create Image qua nút "+" trên composer
     log(`🎨 Browser ${imageIndex + 1}: Tab B - Chọn Create Image...`)
     const textareaB = pageB.locator('#prompt-textarea')
-    await textareaB.click()
-    await textareaB.fill('/')
-    await pageB.waitForTimeout(1000)
-    
-    try {
-      const menu = pageB.locator('[data-radix-popper-content-wrapper], [role="listbox"], [role="menu"]').last()
-      const createOption = menu.locator('text="Create image"').first()
-      await createOption.waitFor({ state: 'visible', timeout: 3000 })
-      await createOption.click({ force: true })
-    } catch {
-      await textareaB.fill('/cr')
-      await pageB.waitForTimeout(1000)
-      await pageB.keyboard.press('Enter')
+
+    let createImageClicked = false
+    for (let attempt = 1; attempt <= 3 && !createImageClicked && !shouldStop; attempt++) {
+      // Chờ popup rate-limit tan
+      for (let i = 0; i < 5; i++) {
+        const blocked = await pageB.evaluate(() => {
+          const t = (document.body?.innerText || '').toLowerCase()
+          return t.includes('quá nhiều yêu cầu') || t.includes('too many requests')
+        })
+        if (!blocked) break
+        await dismissPopup(pageB, log)
+        await pageB.waitForTimeout(1500)
+      }
+
+      // Click nút "+" (aria-label "thêm tệp và nhiều tính năng khác" | "add files and more features")
+      const plusBtn = pageB.locator(
+        'button[aria-label*="thêm tệp" i], button[aria-label*="add files" i], button[aria-label*="more features" i]'
+      ).first()
+
+      try {
+        await plusBtn.waitFor({ state: 'visible', timeout: 5000 })
+        await plusBtn.click({ timeout: 3000 })
+        await pageB.waitForTimeout(1500)
+      } catch {
+        log(`⚠️ Browser ${imageIndex + 1}: lần ${attempt} - không tìm thấy nút +`)
+        await pageB.waitForTimeout(1500)
+        continue
+      }
+
+      // Tìm element có ownText đúng "Tạo hình ảnh" / "Create image" rồi mouse-click tại tọa độ
+      const targetRect = await pageB.evaluate(() => {
+        const keywords = ['tạo hình ảnh', 'tạo ảnh', 'create image', 'create an image']
+        const all = Array.from(document.querySelectorAll('*'))
+        for (const el of all) {
+          const ownText = Array.from(el.childNodes)
+            .filter((n: Node) => n.nodeType === 3)
+            .map((n: Node) => (n.textContent || '').trim().toLowerCase())
+            .join(' ')
+            .trim()
+          if (!ownText) continue
+          if (!keywords.some(k => ownText === k || ownText.startsWith(k))) continue
+          const rect = el.getBoundingClientRect()
+          if (rect.width < 10 || rect.height < 10) continue
+          if (rect.x < 250 && rect.width < 250) continue
+          return { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+        }
+        return null
+      })
+
+      if (targetRect) {
+        const cx = targetRect.x + targetRect.w / 2
+        const cy = targetRect.y + targetRect.h / 2
+        await pageB.mouse.click(cx, cy)
+        log(`✅ Browser ${imageIndex + 1}: click "Tạo hình ảnh" tại (${Math.round(cx)}, ${Math.round(cy)})`)
+        createImageClicked = true
+        await pageB.waitForTimeout(2000)
+      } else {
+        log(`⚠️ Browser ${imageIndex + 1}: lần ${attempt} - menu không có "Tạo hình ảnh"`)
+        await pageB.keyboard.press('Escape').catch(() => {})
+        await pageB.waitForTimeout(2000)
+      }
     }
-    
-    await pageB.waitForTimeout(2000)
+
+    if (!createImageClicked) {
+      throw new Error('Tab B: không chọn được chế độ Tạo hình ảnh sau 3 lần')
+    }
     
     // Upload ảnh lên Tab B
     log(`📤 Browser ${imageIndex + 1}: Tab B - Upload ảnh...`)
+    await ensureNoPopup(pageB)
     const fileInputB = pageB.locator('input[type="file"]').first()
     await fileInputB.setInputFiles(imagePath)
     await pageB.waitForTimeout(waitTimeUpload)
-    
+
     // Fill prompt đã extract
+    await ensureNoPopup(pageB)
     await textareaB.click()
     await textareaB.fill(extractedPrompt)
     await pageB.waitForTimeout(500)
-    
+
     // ===== BƯỚC 5: TAB B - GỬI RENDER =====
     log(`🚀 Browser ${imageIndex + 1}: Tab B - Gửi render...`)
-    await dismissPopup(pageB, log)
-    
+    await ensureNoPopup(pageB)
+
     const sendBtnB = pageB.locator('button[data-testid="send-button"], button[aria-label="Send prompt"]').first()
     await sendBtnB.click()
     
@@ -1118,23 +1262,23 @@ async function processImageInBrowser(
     if (downloaded) {
       log(`✅ Browser ${imageIndex + 1}: Hoàn thành ${fileName}`)
     }
-    
-    // Đóng browser
-    if (context) {
-      await context.close().catch(() => {})
-    }
-    
+
+    if (stopWatcherA) stopWatcherA()
+    if (stopWatcherB) stopWatcherB()
+    if (context) await context.close().catch(() => {})
+
     return { success: downloaded, fileName }
-    
+
   } catch (e) {
-    log(`❌ Browser ${imageIndex + 1}: Lỗi - ${e.message}`)
-    
-    if (context) {
-      await context.close().catch(() => {})
-    }
+    const errMsg = getErrorMessage(e)
+    log(`❌ Browser ${imageIndex + 1}: Lỗi - ${errMsg}`)
+
+    if (stopWatcherA) stopWatcherA()
+    if (stopWatcherB) stopWatcherB()
+    if (context) await context.close().catch(() => {})
+
+    return { success: false, fileName, error: errMsg }
   }
-  
-  return { success: false, fileName, error: e.message }
 }
 
 ipcMain.handle('start-automation', async (event, config) => {
