@@ -1271,28 +1271,54 @@ async function processImageInBrowser(
       }
       await pageB.waitForTimeout(1500)
 
-      // Tìm element có ownText khớp "Tạo hình ảnh" / "Create image" rồi mouse-click tại tọa độ
+      // Tìm element "Create image" / "Tạo hình ảnh" — ưu tiên scan trong menu container vừa mở
       const targetRect = await pageB.evaluate(() => {
         const keywords = [
           'tạo hình ảnh', 'tạo ảnh',
           'create image', 'create an image', 'create images', 'generate image',
           'make image', 'make an image'
         ]
-        const all = Array.from(document.querySelectorAll('*'))
-        for (const el of all) {
-          const ownText = Array.from(el.childNodes)
-            .filter((n: Node) => n.nodeType === 3)
-            .map((n: Node) => (n.textContent || '').trim().toLowerCase())
-            .join(' ')
-            .trim()
-          if (!ownText || ownText.length > 40) continue
-          if (!keywords.some(k => ownText === k || ownText.startsWith(k))) continue
-          const rect = el.getBoundingClientRect()
-          if (rect.width < 10 || rect.height < 10) continue
-          if (rect.x < 250 && rect.width < 250) continue // loại sidebar
-          return { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+        const isMatch = (text: string): boolean => {
+          const t = text.trim().toLowerCase()
+          if (!t) return false
+          return keywords.some(k => t === k || t.startsWith(k) || t.includes(k))
         }
-        return null
+
+        // Ưu tiên các container menu/popover vừa mở (visible, size vừa phải)
+        const menuContainers = Array.from(document.querySelectorAll(
+          '[role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-radix-menu-content], [class*="popover"], [class*="dropdown"]'
+        )).filter(c => {
+          const r = (c as HTMLElement).getBoundingClientRect()
+          return r.width > 100 && r.height > 50
+        })
+
+        const searchRoots: Element[] = menuContainers.length > 0
+          ? (menuContainers as Element[])
+          : [document.body]
+
+        let best: { x: number; y: number; w: number; h: number; area: number } | null = null
+        for (const root of searchRoots) {
+          const all = root.querySelectorAll('*')
+          for (const el of Array.from(all)) {
+            // Chỉ xét leaf-ish: text node trực tiếp khớp
+            const ownText = Array.from(el.childNodes)
+              .filter((n: Node) => n.nodeType === 3)
+              .map((n: Node) => (n.textContent || '').trim())
+              .join(' ')
+              .trim()
+            if (!isMatch(ownText)) continue
+            const rect = (el as HTMLElement).getBoundingClientRect()
+            if (rect.width < 10 || rect.height < 10) continue
+            // Loại nav/aside (sidebar)
+            if (el.closest('nav, aside, [data-testid*="sidebar" i]')) continue
+            const area = rect.width * rect.height
+            if (!best || area < best.area) {
+              best = { x: rect.x, y: rect.y, w: rect.width, h: rect.height, area }
+            }
+          }
+          if (best) break // match trong menu container, không cần fallback body
+        }
+        return best ? { x: best.x, y: best.y, w: best.w, h: best.h } : null
       })
 
       if (targetRect) {
@@ -1383,9 +1409,17 @@ ipcMain.handle('start-automation', async (event, config) => {
   if (isRunning) return { success: false, message: 'Process already running' }
   isRunning = true
   shouldStop = false
-  
+
   const log = (msg: string) => {
-    event.sender.send('automation-log', msg)
+    try {
+      if (event.sender && !event.sender.isDestroyed()) {
+        event.sender.send('automation-log', msg)
+      } else {
+        console.log(`[log after window closed] ${msg}`)
+      }
+    } catch {
+      console.log(`[log error] ${msg}`)
+    }
   }
 
     try {
