@@ -67,7 +67,16 @@
               </div>
             </div>
             <textarea id="prompt-template" placeholder="Nhập template tại đây..."></textarea>
-            
+
+            <div class="input-group">
+              <label>Chế độ render (Tab B)</label>
+              <select id="render-mode">
+                <option value="chatgpt" selected>🤖 ChatGPT — tạo ảnh</option>
+                <option value="flow-image">🎨 Flow — tạo ảnh</option>
+                <option value="flow-video">🎬 Flow — tạo video</option>
+              </select>
+            </div>
+
             <div class="settings-grid">
                <div class="input-group">
                  <label>Chờ Upload (ms)</label>
@@ -138,7 +147,8 @@
           </div>
           <div class="actions" style="margin-top:8px">
             <button id="btn-logout" class="btn-secondary">🚪 Đăng xuất (xoá cookies)</button>
-            <button id="btn-open-login" class="btn-secondary">🔑 Đăng nhập tài khoản mới</button>
+            <button id="btn-open-login" class="btn-secondary">🔑 Đăng nhập ChatGPT</button>
+            <button id="btn-open-login-flow" class="btn-secondary">🎨 Đăng nhập Flow</button>
             <button id="btn-confirm-login" class="btn-primary" disabled>✅ Xác nhận đã đăng nhập</button>
           </div>
         </div>

@@ -10,6 +10,7 @@ const promptTemplate = document.getElementById('prompt-template') as HTMLTextAre
 const waitUpload = document.getElementById('wait-upload') as HTMLInputElement
 const waitGenerate = document.getElementById('wait-generate') as HTMLInputElement
 const maxRetry = document.getElementById('max-retry') as HTMLInputElement
+const renderMode = document.getElementById('render-mode') as HTMLSelectElement
 
 const btnInput = document.getElementById('btn-input') as HTMLButtonElement
 const btnOutput = document.getElementById('btn-output') as HTMLButtonElement
@@ -53,6 +54,7 @@ waitUpload.value = savedConfig.waitTimeUpload || 5000
 const savedWaitGen = parseInt(savedConfig.waitTimeGenerate) || 180000
 waitGenerate.value = String(Math.max(savedWaitGen, 120000))
 maxRetry.value = savedConfig.maxRetry || 3
+renderMode.value = savedConfig.renderMode || 'chatgpt'
 coverImage.value = savedConfig.coverImage || ''
 logoImage.value = savedConfig.logoImage || ''
 logoSize.value = savedConfig.logoSize || 8
@@ -77,6 +79,7 @@ function saveConfig() {
     waitTimeUpload: parseInt(waitUpload.value),
     waitTimeGenerate: parseInt(waitGenerate.value),
     maxRetry: parseInt(maxRetry.value),
+    renderMode: renderMode.value,
     coverImage: coverImage.value,
     logoImage: logoImage.value,
     logoSize: parseInt(logoSize.value),
@@ -268,6 +271,7 @@ btnStop.addEventListener('click', async () => {
 // ========== LOGIN / LOGOUT CONTROLS ==========
 const btnLogout = document.getElementById('btn-logout') as HTMLButtonElement
 const btnOpenLogin = document.getElementById('btn-open-login') as HTMLButtonElement
+const btnOpenLoginFlow = document.getElementById('btn-open-login-flow') as HTMLButtonElement
 const btnConfirmLogin = document.getElementById('btn-confirm-login') as HTMLButtonElement
 
 btnLogout.addEventListener('click', async () => {
@@ -282,13 +286,30 @@ btnLogout.addEventListener('click', async () => {
 
 btnOpenLogin.addEventListener('click', async () => {
   btnOpenLogin.disabled = true
-  addLog('🔑 Đang mở trình duyệt đăng nhập...')
+  btnOpenLoginFlow.disabled = true
+  addLog('🔑 Đang mở trình duyệt đăng nhập ChatGPT...')
   const r = await electron.ipcRenderer.invoke('open-login-browser')
   if (r.success) {
     btnConfirmLogin.disabled = false
     addLog('👉 Đăng nhập ChatGPT + xác thực 2FA xong, bấm "Xác nhận đã đăng nhập".')
   } else {
     btnOpenLogin.disabled = false
+    btnOpenLoginFlow.disabled = false
+    addLog(`❌ Không mở được browser: ${r.message || 'unknown'}`)
+  }
+})
+
+btnOpenLoginFlow.addEventListener('click', async () => {
+  btnOpenLogin.disabled = true
+  btnOpenLoginFlow.disabled = true
+  addLog('🎨 Đang mở trình duyệt đăng nhập Flow (Google)...')
+  const r = await electron.ipcRenderer.invoke('open-login-flow')
+  if (r.success) {
+    btnConfirmLogin.disabled = false
+    addLog('👉 Đăng nhập Google → Flow xong, bấm "Xác nhận đã đăng nhập" để sync sang 4 profile còn lại.')
+  } else {
+    btnOpenLogin.disabled = false
+    btnOpenLoginFlow.disabled = false
     addLog(`❌ Không mở được browser: ${r.message || 'unknown'}`)
   }
 })
@@ -300,6 +321,7 @@ btnConfirmLogin.addEventListener('click', async () => {
   const r = await electron.ipcRenderer.invoke('confirm-login-done')
   btnConfirmLogin.textContent = '✅ Xác nhận đã đăng nhập'
   btnOpenLogin.disabled = false
+  btnOpenLoginFlow.disabled = false
   if (r.success) {
     addLog('✨ Đồng bộ xong. Có thể bấm "Bắt đầu Quy trình".')
   } else {

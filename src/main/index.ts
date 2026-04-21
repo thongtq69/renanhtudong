@@ -1217,6 +1217,592 @@ async function downloadImage(
   }
 }
 
+// ========================================================================
+// ========== GOOGLE LABS FLOW AUTOMATION ==========
+// ========================================================================
+// Tab B (render) có 3 mode: 'chatgpt' (mặc định) | 'flow-image' | 'flow-video'
+// Flow đăng nhập bằng Google → cùng profile-0..4 với ChatGPT là OK (cookies per-domain).
+//
+// Thứ tự bước Flow KHÔNG được đổi (sẽ mất sync hoặc UI reject):
+//   goto → new project → open config → chọn mode (image/video) → (video: chọn Thành phần)
+//   → chọn 16:9 → chọn x1 → close config → paste asset → fill prompt
+//   → wait composer ready → snapshot old imgs/videos → click send
+//   → wait new element xuất hiện → download (fetch trong browser context)
+
+type RenderMode = 'chatgpt' | 'flow-image' | 'flow-video'
+
+// Dismiss consent dialog "Tôi đồng ý" — Flow popup giữa chừng nếu không click sẽ kẹt
+async function dismissFlowConsent(page: Page): Promise<void> {
+  try {
+    const btn = page.locator('button').filter({
+      hasText: /Tôi đồng ý|I agree|Đồng ý|Accept/i
+    }).first()
+    if ((await btn.count()) > 0 && await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+      await btn.click({ timeout: 2000 }).catch(() => {})
+    }
+  } catch {}
+}
+
+// Watcher background: cứ 3s check + dismiss consent dialog
+function startFlowConsentWatcher(page: Page): () => void {
+  let stopped = false
+  ;(async () => {
+    while (!stopped) {
+      try {
+        if (page.isClosed()) break
+        await dismissFlowConsent(page)
+      } catch {}
+      await new Promise(r => setTimeout(r, 3000))
+    }
+  })()
+  return () => { stopped = true }
+}
+
+// Click config button → mở/đóng panel (toggle)
+async function clickFlowConfigButton(page: Page): Promise<boolean> {
+  const cfg = page.locator('button').filter({
+    hasText: /Nano.*x|Video.*x|Hình ảnh.*x|crop/
+  }).first()
+  if ((await cfg.count()) === 0) return false
+  await cfg.click({ timeout: 5000 }).catch(() => {})
+  return true
+}
+
+// Chọn tab trong panel config bằng regex match trên textContent
+async function clickFlowTab(page: Page, regex: RegExp, ensureSelected = true): Promise<boolean> {
+  const tab = page.locator('button.flow_tab_slider_trigger').filter({ hasText: regex }).first()
+  if ((await tab.count()) === 0) return false
+  if (ensureSelected) {
+    const selected = await tab.getAttribute('aria-selected').catch(() => null)
+    if (selected === 'true') return true
+  }
+  await tab.click({ timeout: 5000 }).catch(() => {})
+  return true
+}
+
+// Snapshot img URL hiện tại để waitForFlowAssetReady phân biệt ảnh mới vs ảnh cũ
+// (avatar, placeholder — flower-placeholder.webp 45x77 qua mọi filter size nên phải snapshot trước).
+async function snapshotFlowImgs(page: Page): Promise<string[]> {
+  return await page.evaluate(() => {
+    return Array.from(document.querySelectorAll('img')).map(img => (img as HTMLImageElement).src || '')
+  }).catch(() => [])
+}
+
+// Upload ảnh vào Flow qua hidden file input (Flow có 1 input[type="file"][accept="image/*"] ẩn
+// cho nút "+ Thêm nội dung nghe nhìn"). Playwright's setInputFiles dispatch native change event
+// mà React state listener của Flow nhận được — synthetic ClipboardEvent / DragEvent KHÔNG work.
+async function pasteAssetIntoFlow(page: Page, imagePath: string): Promise<void> {
+  const fileInput = page.locator('input[type="file"][accept*="image"]').first()
+  await fileInput.waitFor({ state: 'attached', timeout: 10000 })
+  await fileInput.setInputFiles(imagePath)
+}
+
+// Chờ asset thumbnail thật sự load xong trong composer.
+// Cần baseline URL trước upload để skip avatar / flower-placeholder / ảnh sẵn có.
+// Ready = có 1 img MỚI (không trong baseline), size > 30px, naturalWidth > 0, complete, AND
+// không còn progressbar visible (upload đang chạy).
+async function waitForFlowAssetReady(
+  page: Page,
+  baselineSrcs: string[],
+  timeoutMs = 120000
+): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (page.isClosed()) return false
+    const state = await page.evaluate((baseline: string[]) => {
+      const imgs = Array.from(document.querySelectorAll('img')) as HTMLImageElement[]
+      const newReady = imgs.filter(img => {
+        const src = img.src || ''
+        if (!src) return false
+        if (baseline.includes(src)) return false
+        if (src.includes('avatar')) return false
+        if (src.includes('googleusercontent.com/a/')) return false
+        if (src.includes('flower-placeholder')) return false
+        const r = img.getBoundingClientRect()
+        if (r.width < 30 || r.height < 30) return false
+        if (!img.complete || img.naturalWidth <= 0) return false
+        return true
+      }).length
+
+      const progressbars = Array.from(document.querySelectorAll('[role="progressbar"]')) as HTMLElement[]
+      const hasProgress = progressbars.some(p => {
+        const r = p.getBoundingClientRect()
+        return r.width > 0 && r.height > 0
+      })
+      return { newReady, hasProgress }
+    }, baselineSrcs).catch(() => ({ newReady: 0, hasProgress: false }))
+
+    if (state.newReady >= 1 && !state.hasProgress) return true
+    await page.waitForTimeout(1000)
+  }
+  return false
+}
+
+// Fill prompt vào composer Flow — Flow dùng Slate editor.
+// Slate chấp nhận 1 `insertText` duy nhất với `\n` embedded → tất cả prompt vào 1 paragraph
+// với soft line breaks. KHÔNG cần loop Enter/Shift+Enter (Flow coi Enter=Submit nên nguy hiểm).
+// Chiến lược: 1 call keyboard.insertText (CDP isTrusted=true), verify placeholder gone.
+// Fallback: synthetic InputEvent với cùng text (cho trường hợp CDP fail).
+async function fillFlowPrompt(page: Page, prompt: string, log?: (s: string) => void): Promise<boolean> {
+  const l = log || (() => {})
+  const isCommitted = async (): Promise<boolean> => {
+    return await page.evaluate(() => !document.querySelector('[data-slate-placeholder="true"]')).catch(() => false)
+  }
+  const pollCommit = async (maxMs = 3000): Promise<boolean> => {
+    const start = Date.now()
+    while (Date.now() - start < maxMs) {
+      await page.waitForTimeout(150)
+      if (await isCommitted()) return true
+    }
+    return false
+  }
+
+  try {
+    await page.bringToFront().catch(() => {})
+    const tb = page.locator('[role="textbox"][contenteditable="true"][data-slate-editor="true"]').first()
+    await tb.waitFor({ state: 'visible', timeout: 5000 })
+    await tb.click({ timeout: 5000 })
+    await page.waitForTimeout(200)
+
+    // Clear existing text (nếu có)
+    await page.keyboard.press('Meta+A').catch(() => {})
+    await page.keyboard.press('Control+A').catch(() => {})
+    await page.keyboard.press('Backspace').catch(() => {})
+    await page.waitForTimeout(150)
+    await tb.click({ timeout: 3000 }).catch(() => {})
+    await page.waitForTimeout(100)
+
+    // === CÁCH A: 1 call keyboard.insertText (CDP Input.insertText, isTrusted=true) ===
+    // Slate tự hiểu \n là soft break, tạo 1 paragraph với nhiều dòng.
+    await page.keyboard.insertText(prompt)
+    if (await pollCommit(3000)) {
+      l(`   fill: cách A (keyboard.insertText 1-shot) OK`)
+      return true
+    }
+    l(`   fill: cách A FAIL sau 3s, thử cách B (synthetic)`)
+
+    // === CÁCH B: synthetic InputEvent qua page.evaluate (fallback khi CDP bị throttle) ===
+    await tb.click({ timeout: 3000 }).catch(() => {})
+    await page.keyboard.press('Meta+A').catch(() => {})
+    await page.keyboard.press('Control+A').catch(() => {})
+    await page.keyboard.press('Backspace').catch(() => {})
+    await page.waitForTimeout(150)
+
+    await page.evaluate((text: string) => {
+      const tb = document.querySelector(
+        '[role="textbox"][contenteditable="true"][data-slate-editor="true"]'
+      ) as HTMLElement | null
+      if (!tb) return
+      tb.focus()
+      const anchor =
+        tb.querySelector('[data-slate-string="true"]') ||
+        tb.querySelector('[data-slate-zero-width]')
+      const firstChild = anchor ? (anchor as HTMLElement).firstChild : null
+      if (anchor && firstChild) {
+        const sel = window.getSelection()
+        const r = document.createRange()
+        r.setStart(firstChild, 0)
+        r.setEnd(firstChild, 0)
+        sel?.removeAllRanges()
+        sel?.addRange(r)
+      }
+      // 1 shot insertText với \n embedded
+      tb.dispatchEvent(new InputEvent('beforeinput', {
+        inputType: 'insertText',
+        data: text,
+        bubbles: true, cancelable: true, composed: true
+      }))
+    }, prompt)
+
+    if (await pollCommit(3000)) {
+      l(`   fill: cách B (synthetic InputEvent) OK`)
+      return true
+    }
+    l(`   fill: cả 2 cách đều FAIL — Slate editor từ chối`)
+    return false
+  } catch (e) {
+    l(`   fill: exception ${e instanceof Error ? e.message : String(e)}`)
+    return false
+  }
+}
+
+// Chờ composer sẵn sàng gửi (send button không disabled)
+async function waitForFlowComposerReady(page: Page, timeoutMs = 60000): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (page.isClosed()) return false
+    const ready = await page.evaluate(() => {
+      // Send button: chứa 'arrow_forward' hoặc text 'Tạo' hoặc aria-label có Send/Gửi
+      const btns = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[]
+      const sendBtn = btns.find(b => {
+        const t = (b.textContent || '').trim()
+        const aria = (b.getAttribute('aria-label') || '').toLowerCase()
+        return (
+          t.includes('arrow_forward') ||
+          /^tạo$/i.test(t) ||
+          aria.includes('send') ||
+          aria.includes('gửi')
+        )
+      })
+      if (!sendBtn) return false
+      if (sendBtn.disabled) return false
+      if (sendBtn.getAttribute('aria-disabled') === 'true') return false
+      const r = sendBtn.getBoundingClientRect()
+      return r.width > 0 && r.height > 0
+    }).catch(() => false)
+    if (ready) return true
+    await page.waitForTimeout(500)
+  }
+  return false
+}
+
+// Click send button (có fallback Enter)
+async function clickFlowSendButton(page: Page): Promise<void> {
+  const sendBtn = page.locator('button').filter({ hasText: /arrow_forward|^Tạo$/i }).first()
+  if ((await sendBtn.count()) > 0) {
+    await sendBtn.click({ timeout: 5000 }).catch(async () => {
+      await page.keyboard.press('Enter').catch(() => {})
+    })
+  } else {
+    await page.keyboard.press('Enter').catch(() => {})
+  }
+}
+
+// ========== FLOW IMAGE: tạo 1 ảnh ==========
+async function runFlowImage(
+  page: Page,
+  imagePath: string,
+  prompt: string,
+  savePath: string,
+  timeoutMs: number,
+  log: (msg: string) => void
+): Promise<boolean> {
+  const stopConsent = startFlowConsentWatcher(page)
+  try {
+    log(`🌐 Flow: goto labs.google/fx/tools/flow`)
+    await page.goto('https://labs.google/fx/vi/tools/flow', { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await page.waitForTimeout(3000)
+    await dismissFlowConsent(page)
+
+    // Nếu đang ở trang lỗi → bấm Quay lại
+    const backBtn = page.locator('button').filter({ hasText: /Quay lại dự án|Back to project/i }).first()
+    if ((await backBtn.count()) > 0) await backBtn.click({ timeout: 3000 }).catch(() => {})
+
+    // Click Dự án mới
+    const newProj = page.locator('button, div').filter({ hasText: /Dự án mới|New project/i }).last()
+    if ((await newProj.count()) > 0) {
+      await newProj.click({ timeout: 5000 }).catch(() => {})
+      log(`✅ Flow: click Dự án mới`)
+    }
+    await page.waitForTimeout(4000)
+
+    // Mở config panel
+    await clickFlowConfigButton(page)
+    await page.waitForTimeout(1500)
+
+    // Chế độ Hình ảnh
+    await clickFlowTab(page, /imageHình ảnh/, true)
+    await page.waitForTimeout(500)
+    // x1 (mặc định x2)
+    await clickFlowTab(page, /^x1$/, false)
+    await page.waitForTimeout(500)
+    // Đóng panel config (click lại config button)
+    await clickFlowConfigButton(page)
+    await page.waitForTimeout(1000)
+    log(`⚙️ Flow: config image x1 xong`)
+
+    // Snapshot img hiện có TRƯỚC khi upload (để phân biệt asset mới)
+    const baselineImgs = await snapshotFlowImgs(page)
+    // Upload ảnh qua hidden file input
+    await pasteAssetIntoFlow(page, imagePath)
+    log(`📎 Flow: upload asset, chờ ảnh load vào composer...`)
+    const assetReady = await waitForFlowAssetReady(page, baselineImgs, 120000)
+    if (!assetReady) throw new Error('Flow: thumbnail asset không xuất hiện sau 2 phút')
+    log(`✅ Flow: asset đã load xong vào composer`)
+
+    // Fill prompt — abort nếu Slate state không nhận.
+    // Gửi khi state rỗng sẽ bị Flow chặn với "Bạn phải cung cấp câu lệnh" và tốn quota.
+    const filled = await fillFlowPrompt(page, prompt, log)
+    log(`📝 Flow: điền prompt (${prompt.length} chars) — ${filled ? 'ok' : 'FAIL'}`)
+    if (!filled) throw new Error('Flow: không điền được prompt vào Slate composer')
+
+    // Snapshot existing media URLs trước khi send (để phát hiện ảnh output mới)
+    const preSendSources: string[] = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('img'))
+        .map(img => (img as HTMLImageElement).src || '')
+        .filter(Boolean)
+    })
+
+    await clickFlowSendButton(page)
+    log(`🚀 Flow: đã gửi, chờ ảnh generate xong...`)
+
+    // Poll phát hiện output. Signal ready THẬT:
+    //   - img có src mới (không trong preSendSources)
+    //   - src chứa 'media.getMediaUrlRedirect' (Flow generated asset URL)
+    //   - naturalWidth >= 400 (ảnh final, không phải thumb/placeholder)
+    //   - complete === true (đã load xong bytes)
+    //   - KHÔNG còn progressbar visible (generation hoàn tất)
+    let outputSrc: string | null = null
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      if (page.isClosed()) break
+      const res = await page.evaluate((old: string[]) => {
+        const imgs = Array.from(document.querySelectorAll('img')) as HTMLImageElement[]
+        const outputs = imgs.filter(img => {
+          const src = img.src || ''
+          if (!src || old.includes(src)) return false
+          if (!src.includes('media.getMediaUrlRedirect')) return false
+          if (src.includes('avatar') || src.includes('flower-placeholder')) return false
+          if (src.includes('googleusercontent.com/a/')) return false
+          if (!img.complete || img.naturalWidth < 400) return false
+          return true
+        })
+        const progressbars = Array.from(document.querySelectorAll('[role="progressbar"]'))
+          .filter(p => (p as HTMLElement).getBoundingClientRect().width > 0)
+        // Check DOM text cho % progress (Flow hiển thị "3%", "50%" etc khi đang generate)
+        const hasProgressText = /\b\d{1,3}\s*%/.test(document.body.innerText || '')
+        const best = outputs.reduce<HTMLImageElement | null>((a, b) =>
+          !a || b.naturalWidth > a.naturalWidth ? b : a, null)
+        return {
+          bestSrc: best?.src || null,
+          bestNaturalW: best?.naturalWidth || 0,
+          hasProgress: progressbars.length > 0,
+          hasProgressText,
+        }
+      }, preSendSources).catch(() => null)
+
+      if (res?.bestSrc && !res.hasProgress && !res.hasProgressText) {
+        outputSrc = res.bestSrc
+        log(`✅ Flow: ảnh generate xong (${res.bestNaturalW}px natural) sau ${Math.round((Date.now()-start)/1000)}s`)
+        break
+      }
+      await page.waitForTimeout(2000)
+    }
+
+    if (!outputSrc) {
+      log(`❌ Flow: timeout chờ ảnh generate sau ${Math.round(timeoutMs/1000)}s`)
+      return false
+    }
+
+    const firstSrc = outputSrc
+    log(`📥 Flow: tải ảnh từ ${firstSrc.slice(0, 80)}...`)
+
+    if (firstSrc.startsWith('data:image')) {
+      const base64 = firstSrc.split('base64,')[1] || ''
+      await fs.writeFile(savePath, Buffer.from(base64, 'base64'))
+    } else if (firstSrc.startsWith('blob:')) {
+      const dataUrl = await page.evaluate(async (url) => {
+        const r = await fetch(url)
+        const b = await r.blob()
+        return await new Promise<string>((resolve) => {
+          const reader = new FileReader()
+          reader.onloadend = () => resolve(reader.result as string)
+          reader.readAsDataURL(b)
+        })
+      }, firstSrc)
+      const base64 = dataUrl.split('base64,')[1] || ''
+      await fs.writeFile(savePath, Buffer.from(base64, 'base64'))
+    } else {
+      // HTTPS URL — fetch trong browser context. KHÔNG dùng credentials:'include'
+      // vì Flow's media URL redirect sang Google storage cross-origin, trả về CORS error
+      // "Failed to fetch". Default fetch mode tự động kèm cookie same-origin đủ để pass.
+      // Trả về base64 thay vì Array.from(Uint8Array) — nhỏ hơn ~30%, tránh size limit.
+      const b64 = await page.evaluate(async (url) => {
+        const r = await fetch(url)
+        if (!r.ok) throw new Error(`fetch ${r.status}`)
+        const ab = await r.arrayBuffer()
+        const bytes = new Uint8Array(ab)
+        let s = ''
+        const CHUNK = 0x8000
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          s += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)))
+        }
+        return btoa(s)
+      }, firstSrc)
+      await fs.writeFile(savePath, Buffer.from(b64, 'base64'))
+    }
+
+    const stat = await fs.stat(savePath)
+    log(`✅ Flow: lưu ảnh ${(stat.size / 1024).toFixed(0)} KB → ${savePath}`)
+    return true
+  } finally {
+    stopConsent()
+  }
+}
+
+// ========== FLOW VIDEO: tạo 1 video ==========
+async function runFlowVideo(
+  page: Page,
+  imagePath: string,
+  prompt: string,
+  savePath: string,
+  timeoutMs: number,
+  log: (msg: string) => void
+): Promise<boolean> {
+  const stopConsent = startFlowConsentWatcher(page)
+  try {
+    log(`🌐 Flow-video: goto labs.google/fx/tools/flow`)
+    await page.goto('https://labs.google/fx/vi/tools/flow', { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await page.waitForTimeout(3000)
+    await dismissFlowConsent(page)
+
+    const backBtn = page.locator('button').filter({ hasText: /Quay lại dự án|Back to project/i }).first()
+    if ((await backBtn.count()) > 0) await backBtn.click({ timeout: 3000 }).catch(() => {})
+
+    const newProj = page.locator('button, div').filter({ hasText: /Dự án mới|New project/i }).last()
+    if ((await newProj.count()) > 0) {
+      await newProj.click({ timeout: 5000 }).catch(() => {})
+      log(`✅ Flow-video: click Dự án mới`)
+    }
+    await page.waitForTimeout(4000)
+
+    // Mở config panel
+    await clickFlowConfigButton(page)
+    await page.waitForTimeout(1500)
+
+    // Chế độ Video
+    await clickFlowTab(page, /videocamVideo/, true)
+    await page.waitForTimeout(800)
+    // Thành phần (Components) thay vì Khung hình mặc định
+    await clickFlowTab(page, /chrome_extensionThành phần/, true)
+    await page.waitForTimeout(500)
+    // 16:9 (thường đã default, đảm bảo active)
+    await clickFlowTab(page, /crop_16_916:9/, true)
+    await page.waitForTimeout(500)
+    // x1 (mặc định x2)
+    await clickFlowTab(page, /^x1$/, false)
+    await page.waitForTimeout(500)
+
+    // Ép model = Veo 3.1 - Quality (tránh default drift sang Fast/Lite).
+    // Dropdown model là button có aria-haspopup="menu" và text bắt đầu bằng "Veo".
+    await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[]
+      const dd = btns.find(b =>
+        b.getAttribute('aria-haspopup') === 'menu' && /^Veo\s/i.test((b.textContent || '').trim())
+      )
+      dd?.click()
+    })
+    await page.waitForTimeout(600)
+    await page.evaluate(() => {
+      const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menu"] button'))
+      // Chỉ match "Veo 3.1 - Quality" chuẩn, KHÔNG match "[Lower Priority]" variant
+      const target = items.find(el => {
+        const t = (el.textContent || '').trim()
+        return /Veo\s*3\.1\s*-\s*Quality\b/i.test(t) && !/Lower Priority/i.test(t)
+      }) as HTMLElement | undefined
+      target?.click()
+    })
+    await page.waitForTimeout(500)
+
+    // Đóng config
+    await clickFlowConfigButton(page)
+    await page.waitForTimeout(1000)
+    log(`⚙️ Flow-video: config Video / Thành phần / 16:9 / x1 / Veo 3.1 - Quality xong`)
+
+    // Snapshot img hiện có TRƯỚC upload để phân biệt asset mới
+    const baselineImgs = await snapshotFlowImgs(page)
+    // Upload ảnh qua hidden file input
+    await pasteAssetIntoFlow(page, imagePath)
+    log(`📎 Flow-video: upload asset, chờ ảnh load vào composer...`)
+    const assetReady = await waitForFlowAssetReady(page, baselineImgs, 120000)
+    if (!assetReady) throw new Error('Flow-video: thumbnail asset không xuất hiện sau 2 phút')
+    log(`✅ Flow-video: asset đã load xong vào composer`)
+
+    // Fill prompt — abort nếu Slate state không nhận.
+    const filled = await fillFlowPrompt(page, prompt, log)
+    log(`📝 Flow-video: điền prompt (${prompt.length} chars) — ${filled ? 'ok' : 'FAIL'}`)
+    if (!filled) throw new Error('Flow-video: không điền được prompt vào Slate composer')
+
+    // Snapshot existing video src
+    const oldVideos: string[] = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('video'))
+        .map(v => (v as HTMLVideoElement).src || (v as HTMLVideoElement).currentSrc || '')
+    })
+
+    await clickFlowSendButton(page)
+    log(`🚀 Flow-video: đã gửi, chờ video render (có thể đến 10 phút)...`)
+
+    // Chờ <video> có src chứa 'media.getMediaUrlRedirect' (signature Flow)
+    try {
+      await page.waitForFunction(
+        ({ old }: { old: string[] }) => {
+          const vids = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[]
+          const fresh = vids.filter(v => {
+            const src = v.src || v.currentSrc || ''
+            return !!src && !old.includes(src) && src.includes('media.getMediaUrlRedirect')
+          })
+          return fresh.length >= 1
+        },
+        { old: oldVideos },
+        { timeout: timeoutMs }
+      )
+    } catch (err) {
+      log(`⚠️ Flow-video: timeout chờ video sau ${Math.round(timeoutMs / 1000)}s — thử tiếp`)
+    }
+
+    await page.waitForTimeout(5000)
+
+    // Lấy video URL
+    const newVideos: Array<{ src: string }> = await page.evaluate((old) => {
+      return Array.from(document.querySelectorAll('video'))
+        .map(v => ({ src: (v as HTMLVideoElement).src || (v as HTMLVideoElement).currentSrc || '' }))
+        .filter(v => v.src && !old.includes(v.src) && v.src.includes('media.getMediaUrlRedirect'))
+    }, oldVideos)
+
+    if (newVideos.length === 0) {
+      // Fallback: bất kỳ video mới nào (blob OK)
+      const anyNew: Array<{ src: string }> = await page.evaluate((old) => {
+        return Array.from(document.querySelectorAll('video'))
+          .map(v => ({ src: (v as HTMLVideoElement).src || (v as HTMLVideoElement).currentSrc || '' }))
+          .filter(v => v.src && !old.includes(v.src))
+      }, oldVideos)
+      if (anyNew.length === 0) {
+        log(`❌ Flow-video: không tìm thấy video mới`)
+        return false
+      }
+      newVideos.push(...anyNew)
+    }
+
+    const firstSrc = newVideos[0].src
+    log(`📥 Flow-video: tải video từ ${firstSrc.slice(0, 100)}...`)
+
+    if (firstSrc.startsWith('blob:')) {
+      const dataUrl = await page.evaluate(async (url) => {
+        const r = await fetch(url)
+        const b = await r.blob()
+        return await new Promise<string>((resolve) => {
+          const reader = new FileReader()
+          reader.onloadend = () => resolve(reader.result as string)
+          reader.readAsDataURL(b)
+        })
+      }, firstSrc)
+      const base64 = dataUrl.split('base64,')[1] || ''
+      await fs.writeFile(savePath, Buffer.from(base64, 'base64'))
+    } else {
+      // Không dùng credentials:'include' — Flow redirect cross-origin bị CORS block.
+      const b64 = await page.evaluate(async (url) => {
+        const r = await fetch(url)
+        if (!r.ok) throw new Error(`fetch ${r.status}`)
+        const ab = await r.arrayBuffer()
+        const bytes = new Uint8Array(ab)
+        let s = ''
+        const CHUNK = 0x8000
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          s += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)))
+        }
+        return btoa(s)
+      }, firstSrc)
+      await fs.writeFile(savePath, Buffer.from(b64, 'base64'))
+    }
+
+    const stat = await fs.stat(savePath)
+    log(`✅ Flow-video: lưu ${(stat.size / 1024 / 1024).toFixed(1)} MB → ${savePath}`)
+    return true
+  } finally {
+    stopConsent()
+  }
+}
+
 // ========== HÀM XỬ LÝ 1 ẢNH TRONG 1 BROWSER ==========
 
 // Thư mục lưu profiles cố định cho 5 browsers
@@ -1232,11 +1818,13 @@ async function processImageInBrowser(
   outputFolder: string,
   waitTimeUpload: number,
   waitTimeGenerate: number,
-  log: (msg: string) => void
+  log: (msg: string) => void,
+  renderMode: RenderMode = 'chatgpt'
 ): Promise<{ success: boolean; fileName: string; error?: string }> {
-  
+
   const fileName = path.basename(imagePath)
-  const targetFilename = `SH_AI_${path.parse(fileName).name}.png`
+  const outExt = renderMode === 'flow-video' ? 'mp4' : 'png'
+  const targetFilename = `SH_AI_${path.parse(fileName).name}.${outExt}`
   const finalSavePath = path.join(outputFolder, targetFilename)
   
   log(`🚀 Browser ${imageIndex + 1}/5: Bắt đầu xử lý ${fileName}`)
@@ -1267,7 +1855,16 @@ async function processImageInBrowser(
     // Thư mục profile cố định cho browser này
     const profileDir = getBrowserProfileDir(imageIndex)
     await fs.ensureDir(profileDir)
-    
+
+    // Clean lock files còn sót từ lần crash/force-quit trước — nếu không Chrome sẽ "Mở trong phiên hiện tại"
+    // rồi tự close context mới, gây lỗi launchPersistentContext.
+    for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'RunningChromeVersion']) {
+      const lockPath = path.join(profileDir, lockName)
+      try {
+        await fs.remove(lockPath)
+      } catch {}
+    }
+
     log(`🌐 Browser ${imageIndex + 1}: Mở browser tại (${pos.x}, ${pos.y})`)
     log(`📂 Profile: ${profileDir}`)
     
@@ -1282,6 +1879,13 @@ async function processImageInBrowser(
         '--disable-setuid-sandbox',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
+        // Disable occlusion/background throttling — KHI CHẠY SONG SONG NHIỀU WINDOW,
+        // các window bị occluded sẽ throttle input, khiến keyboard.insertText trên Slate
+        // editor không commit state. Ép Chrome coi tất cả window như visible.
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-background-timer-throttling',
+        '--disable-features=CalculateNativeWinOcclusion',
         `--window-position=${pos.x},${pos.y}`
       ]
     })
@@ -1346,7 +1950,10 @@ async function processImageInBrowser(
     }
     
     log(`📝 Browser ${imageIndex + 1}: Đã extract prompt (${extractedPrompt.length} chars)`)
-    
+
+    let downloaded = false
+
+    if (renderMode === 'chatgpt') {
     // ===== BƯỚC 4: TAB B - PREPARE RENDER =====
     log(`🌐 Browser ${imageIndex + 1}: Tab B - Mở ChatGPT...`)
     await pageB.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 60000 })
@@ -1523,8 +2130,19 @@ async function processImageInBrowser(
     
     // ===== BƯỚC 6: TAB B - TẢI ẢNH =====
     await pageB.waitForTimeout(3000)
-    const downloaded = await downloadImage(pageB, imageIndex, finalSavePath, log)
-    
+    downloaded = await downloadImage(pageB, imageIndex, finalSavePath, log)
+    } else if (renderMode === 'flow-image') {
+      // ===== FLOW IMAGE =====
+      log(`🎨 Browser ${imageIndex + 1}: Tab B - Render qua Flow (image)...`)
+      const flowTimeout = Math.max(waitTimeGenerate, 360000) // tối thiểu 6 phút
+      downloaded = await runFlowImage(pageB, imagePath, extractedPrompt, finalSavePath, flowTimeout, log)
+    } else if (renderMode === 'flow-video') {
+      // ===== FLOW VIDEO =====
+      log(`🎬 Browser ${imageIndex + 1}: Tab B - Render qua Flow (video)...`)
+      const flowTimeout = Math.max(waitTimeGenerate, 600000) // tối thiểu 10 phút
+      downloaded = await runFlowVideo(pageB, imagePath, extractedPrompt, finalSavePath, flowTimeout, log)
+    }
+
     if (downloaded) {
       log(`✅ Browser ${imageIndex + 1}: Hoàn thành ${fileName}`)
     }
@@ -1572,13 +2190,19 @@ ipcMain.handle('start-automation', async (event, config) => {
       promptTemplate,
       waitTimeUpload,
       waitTimeGenerate,
-      maxRetry
+      maxRetry,
+      renderMode: rawRenderMode
     } = config
+
+    const renderMode: RenderMode =
+      rawRenderMode === 'flow-image' || rawRenderMode === 'flow-video' ? rawRenderMode : 'chatgpt'
 
     const finalOutputFolder = outputFolder || path.join(inputFolder, 'AI')
     const CONCURRENCY = 5
     const retryCap = Math.max(0, parseInt(maxRetry) || 3)
-    log(`🚀 Bắt đầu quy trình với ${CONCURRENCY} BROWSERS song song, max retry = ${retryCap}`)
+    const modeLabel =
+      renderMode === 'flow-image' ? 'Flow (ảnh)' : renderMode === 'flow-video' ? 'Flow (video)' : 'ChatGPT'
+    log(`🚀 Bắt đầu quy trình [${modeLabel}] với ${CONCURRENCY} BROWSERS song song, max retry = ${retryCap}`)
 
     await fs.ensureDir(finalOutputFolder)
 
@@ -1612,7 +2236,8 @@ ipcMain.handle('start-automation', async (event, config) => {
             finalOutputFolder,
             waitTimeUpload || 5000,
             waitTimeGenerate || 120000,
-            log
+            log,
+            renderMode
           )
         })
       )
@@ -1708,7 +2333,10 @@ ipcMain.handle('logout-accounts', async () => {
 let loginContext: BrowserContext | null = null
 
 // ========== OPEN LOGIN BROWSER: mở profile-0, chờ user login + 2FA ==========
-ipcMain.handle('open-login-browser', async (event) => {
+async function openLoginBrowserFor(
+  site: 'chatgpt' | 'flow',
+  event: Electron.IpcMainInvokeEvent
+): Promise<{ success: boolean; message?: string }> {
   if (loginContext) {
     return { success: false, message: 'Đang có phiên login khác mở, vui lòng confirm hoặc hủy trước' }
   }
@@ -1718,7 +2346,11 @@ ipcMain.handle('open-login-browser', async (event) => {
   try {
     const profileDir = getBrowserProfileDir(0)
     await fs.ensureDir(profileDir)
-    log(`🔑 Mở trình duyệt đăng nhập tại profile-0...`)
+    // Clean stale singleton locks
+    for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'RunningChromeVersion']) {
+      try { await fs.remove(path.join(profileDir, lockName)) } catch {}
+    }
+    log(`🔑 Mở trình duyệt đăng nhập ${site === 'flow' ? 'Flow (Google)' : 'ChatGPT'} tại profile-0...`)
     loginContext = await chromium.launchPersistentContext(profileDir, {
       headless: false,
       viewport: { width: 1280, height: 900 },
@@ -1726,21 +2358,23 @@ ipcMain.handle('open-login-browser', async (event) => {
       args: ['--disable-blink-features=AutomationControlled', '--disable-infobars']
     })
     const page = loginContext.pages()[0] || await loginContext.newPage()
-    await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 60000 })
-    log(`✅ Browser đã mở. Đăng nhập (kể cả 2FA) xong thì bấm "Xác nhận đã đăng nhập" trong app.`)
+    const url = site === 'flow' ? 'https://labs.google/fx/vi/tools/flow' : 'https://chatgpt.com'
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    log(`✅ Browser đã mở (${url}). Đăng nhập xong thì bấm "Xác nhận đã đăng nhập" trong app.`)
 
-    // Khi user đóng browser thủ công → coi như hủy phiên login
     loginContext.on('close', () => {
       loginContext = null
       log(`⚠️ Browser login đã đóng. Nếu chưa bấm "Xác nhận", session KHÔNG được copy.`)
     })
-
     return { success: true }
   } catch (err) {
     loginContext = null
     return { success: false, message: getErrorMessage(err) }
   }
-})
+}
+
+ipcMain.handle('open-login-browser', async (event) => openLoginBrowserFor('chatgpt', event))
+ipcMain.handle('open-login-flow', async (event) => openLoginBrowserFor('flow', event))
 
 // ========== CONFIRM LOGIN DONE: copy profile-0 sang 1..4, đóng browser ==========
 ipcMain.handle('confirm-login-done', async (event) => {
@@ -1760,10 +2394,15 @@ ipcMain.handle('confirm-login-done', async (event) => {
       return { success: false, message: 'Profile-0 không tồn tại' }
     }
     log(`📋 Copy session sang profile 1..4...`)
+    // Skip volatile lock files / broken symlinks mà Chromium tạo runtime
+    const SKIP_FILES = new Set(['RunningChromeVersion', 'SingletonLock', 'SingletonCookie', 'SingletonSocket'])
     for (let i = 1; i <= 4; i++) {
       const dst = getBrowserProfileDir(i)
       await fs.remove(dst)
-      await fs.copy(src, dst)
+      await fs.copy(src, dst, {
+        filter: (srcPath) => !SKIP_FILES.has(path.basename(srcPath)),
+        dereference: false
+      })
       log(`  ✅ profile-${i}`)
     }
     log(`✨ Đã đồng bộ login cho 5 browsers. Sẵn sàng chạy lại quy trình.`)
