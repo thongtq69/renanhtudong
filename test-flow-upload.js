@@ -48,10 +48,148 @@ const LAUNCH_ARGS = [
   '--disable-features=CalculateNativeWinOcclusion',
 ]
 
+function readPngDims(filePath) {
+  try {
+    const fd = require('fs').openSync(filePath, 'r')
+    const buf = Buffer.alloc(24)
+    require('fs').readSync(fd, buf, 0, 24, 0)
+    require('fs').closeSync(fd)
+    if (buf.slice(1, 4).toString() === 'PNG') return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) }
+    if (buf[0] === 0xFF && buf[1] === 0xD8) return { w: 0, h: 0 } // JPEG: skip, fallback to >=256 threshold
+  } catch {}
+  return { w: 0, h: 0 }
+}
+
 async function snapshotFlowImgs(page) {
   return await page.evaluate(() =>
     Array.from(document.querySelectorAll('img')).map(img => img.src || '')
   ).catch(() => [])
+}
+
+async function dismissConsentDialog(page) {
+  try {
+    const btn = page.locator('button').filter({ hasText: /Tôi đồng ý|I agree|Đồng ý|Accept/ }).first()
+    if (await btn.count() > 0 && await btn.isVisible()) { await btn.click().catch(() => {}); return true }
+  } catch {}
+  return false
+}
+
+function startDialogWatcher(page) {
+  let stopped = false
+  ;(async () => {
+    while (!stopped) {
+      if (page.isClosed?.()) break
+      await dismissConsentDialog(page)
+      await page.waitForTimeout(3000).catch(() => {})
+    }
+  })()
+  return () => { stopped = true }
+}
+
+async function pasteAssetIntoPrompt(page, imagePath) {
+  const buf = await fs.readFile(imagePath)
+  const base64 = buf.toString('base64')
+  const ext = path.extname(imagePath).slice(1).toLowerCase() || 'png'
+  const srcMime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+    : ext === 'webp' ? 'image/webp'
+    : 'image/png'
+
+  const tb = page.locator('[role="textbox"][contenteditable="true"][data-slate-editor="true"]').last()
+  await tb.waitFor({ state: 'visible', timeout: 15000 })
+  await tb.scrollIntoViewIfNeeded().catch(() => {})
+  await tb.click({ timeout: 5000 })
+  await page.waitForTimeout(300)
+
+  // Clipboard API chỉ hỗ trợ image/png — JPEG/WebP phải re-encode qua canvas.
+  await page.evaluate(async ({ b64, srcMime }) => {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    let pngBlob
+    if (srcMime === 'image/png') {
+      pngBlob = new Blob([bytes], { type: 'image/png' })
+    } else {
+      const srcBlob = new Blob([bytes], { type: srcMime })
+      const url = URL.createObjectURL(srcBlob)
+      try {
+        const img = await new Promise((res, rej) => {
+          const el = new Image()
+          el.onload = () => res(el); el.onerror = () => rej(new Error('decode-fail'))
+          el.src = url
+        })
+        const canvas = document.createElement('canvas')
+        canvas.width = img.naturalWidth; canvas.height = img.naturalHeight
+        canvas.getContext('2d').drawImage(img, 0, 0)
+        pngBlob = await new Promise((res, rej) => {
+          canvas.toBlob(b => b ? res(b) : rej(new Error('encode-fail')), 'image/png')
+        })
+      } finally { URL.revokeObjectURL(url) }
+    }
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })])
+  }, { b64: base64, srcMime })
+
+  await tb.click({ timeout: 3000 }).catch(() => {})
+  await page.waitForTimeout(150)
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V')
+}
+
+async function waitForComposerAttachment(page, _w, _h, timeoutMs = 60000) {
+  // Scope bằng geo: img có tâm nằm trong ~500x300 quanh textbox (composer bar).
+  const start = Date.now()
+  let stableCount = 0
+  let lastSrc = null
+  while (Date.now() - start < timeoutMs) {
+    const state = await page.evaluate(() => {
+      const tb = document.querySelector('[role="textbox"][contenteditable="true"][data-slate-editor="true"]')
+      if (!tb) return { ok: false, reason: 'no-textbox' }
+      const tbR = tb.getBoundingClientRect()
+      const tcx = tbR.left + tbR.width/2, tcy = tbR.top + tbR.height/2
+      const nearby = Array.from(document.querySelectorAll('img')).filter(img => {
+        const r = img.getBoundingClientRect()
+        if (!r.width || !r.height) return false
+        const cx = r.left + r.width/2, cy = r.top + r.height/2
+        return Math.abs(cx - tcx) < 500 && Math.abs(cy - tcy) < 300
+      })
+      const thumb = nearby.find(img => {
+        const src = img.src || ''
+        if (!src || src.includes('avatar') || src.includes('googleusercontent.com/a/')) return false
+        if (!img.complete || img.naturalWidth < 10) return false
+        if (!(src.startsWith('blob:') || src.startsWith('data:') || src.startsWith('http'))) return false
+        const r = img.getBoundingClientRect()
+        return r.width >= 30 && r.height >= 30
+      })
+      const dump = nearby.slice(0, 5).map(i => {
+        const r = i.getBoundingClientRect()
+        return `${Math.round(r.width)}x${Math.round(r.height)}/nat${i.naturalWidth}x${i.naturalHeight}/${(i.src||'').slice(0,20)}`
+      }).join('|')
+      return { ok: !!thumb, reason: thumb ? 'ok' : `no-match near textbox (${nearby.length}): ${dump}`, thumbSrc: thumb?.src?.slice(0, 60) }
+    }).catch(e => ({ ok: false, reason: `err:${e.message?.slice(0,40)}` }))
+    if (state.ok) {
+      if (state.thumbSrc === lastSrc) stableCount++
+      else { stableCount = 1; lastSrc = state.thumbSrc }
+      if (stableCount >= 2) return { ok: true, reason: state.reason, thumbSrc: state.thumbSrc }
+    } else {
+      stableCount = 0; lastSrc = null
+    }
+    await page.waitForTimeout(1000)
+  }
+  // Final debug dump
+  const finalDump = await page.evaluate(() => {
+    const tb = document.querySelector('[role="textbox"][contenteditable="true"][data-slate-editor="true"]')
+    if (!tb) return 'no-tb'
+    const tbR = tb.getBoundingClientRect()
+    const tcx = tbR.left + tbR.width/2, tcy = tbR.top + tbR.height/2
+    const nearby = Array.from(document.querySelectorAll('img')).filter(img => {
+      const r = img.getBoundingClientRect()
+      const cx = r.left + r.width/2, cy = r.top + r.height/2
+      return Math.abs(cx - tcx) < 500 && Math.abs(cy - tcy) < 300
+    })
+    return nearby.map(i => {
+      const r = i.getBoundingClientRect()
+      return `${Math.round(r.width)}x${Math.round(r.height)}@${Math.round(r.left)},${Math.round(r.top)} nat${i.naturalWidth}x${i.naturalHeight} ${(i.src||'').slice(0,40)}`
+    }).join('\n  ')
+  }).catch(e => `err:${e.message}`)
+  return { ok: false, reason: `timeout\n  nearby imgs:\n  ${finalDump}`, thumbSrc: lastSrc }
 }
 
 async function waitForFlowAssetReady(page, baseline, timeoutMs = 60000) {
@@ -155,35 +293,72 @@ async function runOneWindow(winIdx) {
     viewport: { width: 1280, height: 800 },
     ignoreDefaultArgs: ['--enable-automation'],
     args: [...LAUNCH_ARGS, `--window-position=${100 + winIdx*50},${100 + winIdx*30}`],
+    permissions: ['clipboard-read', 'clipboard-write'],
   })
+  await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://labs.google' }).catch(() => {})
   for (const p of ctx.pages()) if (p.url() === 'about:blank') await p.close().catch(()=>{})
 
+  let stopWatcher = () => {}
   try {
     const page = await ctx.newPage()
     log(`🌐 goto Flow`)
     await page.goto('https://labs.google/fx/vi/tools/flow', { waitUntil: 'domcontentloaded' })
     await page.waitForTimeout(2500)
+    stopWatcher = startDialogWatcher(page)
+    await dismissConsentDialog(page)
 
-    const newProj = page.locator('button, div').filter({ hasText: /Dự án mới|New project/i }).last()
+    const errBack = page.locator('button:has-text("Quay lại dự án"), button:has-text("Quay lai du an")').first()
+    if (await errBack.count() > 0) await errBack.click().catch(() => {})
+
+    const newProj = page.locator('button, div').filter({ hasText: /Dự án mới|Du an moi|New project/i }).last()
     if (await newProj.count() > 0) await newProj.click().catch(() => {})
     await page.waitForTimeout(4000)
 
-    const configBtn = page.locator('button').filter({ hasText: /Video.*x|Hình ảnh.*x|Nano.*x/ }).first()
+    const configBtn = page.locator('button').filter({ hasText: /Video.*x|Hình ảnh.*x|Nano.*x|crop/ }).first()
+    await configBtn.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {})
     await configBtn.click().catch(() => {})
-    await page.waitForTimeout(800)
+    await page.waitForTimeout(1500)
+
     const imgTab = page.locator('button.flow_tab_slider_trigger').filter({ hasText: /imageHình ảnh/i }).first()
-    if (await imgTab.count() > 0) await imgTab.click().catch(() => {})
+    if (await imgTab.count() > 0) {
+      const sel = await imgTab.getAttribute('aria-selected').catch(() => null)
+      if (sel !== 'true') await imgTab.click().catch(() => {})
+    }
     await page.waitForTimeout(400)
-    await page.keyboard.press('Escape').catch(() => {})
+
+    const x1Btn = page.locator('button.flow_tab_slider_trigger').filter({ hasText: /^x1$/ }).first()
+    if (await x1Btn.count() > 0) await x1Btn.click().catch(() => {})
+    await page.waitForTimeout(300)
+
+    await configBtn.click().catch(() => {})
     await page.waitForTimeout(500)
 
-    log(`📎 upload`)
-    const baseline = await snapshotFlowImgs(page)
-    const fileInput = page.locator('input[type="file"][accept*="image"]').first()
-    await fileInput.waitFor({ state: 'attached', timeout: 10000 })
-    await fileInput.setInputFiles(IMAGE)
-    if (!(await waitForFlowAssetReady(page, baseline, 60000))) { log(`❌ asset not ready`); return }
-    log(`✅ asset ready`)
+    log(`📎 paste asset vào ô chat`)
+    const dims = readPngDims(IMAGE)
+    await pasteAssetIntoPrompt(page, IMAGE)
+    const attached = await waitForComposerAttachment(page, dims.w, dims.h, 60000)
+    const shotPath = path.join(os.tmpdir(), `flow_${attached.ok ? 'ok' : 'fail'}_w${winIdx+1}.png`)
+    await page.screenshot({ path: shotPath }).catch(() => {})
+    log(`${attached.ok ? '✅' : '❌'} composer check: ${attached.reason} (src: ${(attached.thumbSrc||'').slice(0,60)}) → ${shotPath}`)
+    if (!attached.ok) {
+      const dump = await page.evaluate(() => {
+        const tb = document.querySelector('[role="textbox"][contenteditable="true"][data-slate-editor="true"]')
+        const form = tb?.closest('form')
+        if (!form) return { err: 'no-form-or-tb' }
+        const imgs = Array.from(form.querySelectorAll('img')).map(i => ({
+          src: (i.src||'').slice(0,80), nw: i.naturalWidth, nh: i.naturalHeight,
+          rw: Math.round(i.getBoundingClientRect().width), rh: Math.round(i.getBoundingClientRect().height)
+        }))
+        const bgs = Array.from(form.querySelectorAll('*')).filter(el => {
+          const bg = getComputedStyle(el).backgroundImage
+          return bg && bg !== 'none' && (bg.includes('url(') || bg.includes('blob'))
+        }).slice(0,5).map(el => ({ tag: el.tagName, bg: getComputedStyle(el).backgroundImage.slice(0,80), rw: Math.round(el.getBoundingClientRect().width), rh: Math.round(el.getBoundingClientRect().height) }))
+        const canvases = Array.from(form.querySelectorAll('canvas')).map(c => ({ w: c.width, h: c.height }))
+        return { imgs, bgs, canvases, formHtml: form.outerHTML.slice(0, 2000) }
+      }).catch(e => ({ err: e.message }))
+      log(`DOM dump: ${JSON.stringify(dump, null, 0).slice(0, 1500)}`)
+      return
+    }
 
     log(`📝 fill (${PROMPT.length} chars)`)
     const filled = await fillFlowPrompt(page, PROMPT, log)
@@ -191,6 +366,7 @@ async function runOneWindow(winIdx) {
   } catch (e) {
     log(`💥 ${e.message}`)
   } finally {
+    stopWatcher()
     await new Promise(r => setTimeout(r, 5000))
     await ctx.close().catch(() => {})
   }

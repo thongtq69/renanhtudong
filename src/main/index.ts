@@ -1288,51 +1288,108 @@ async function snapshotFlowImgs(page: Page): Promise<string[]> {
   }).catch(() => [])
 }
 
-// Upload ảnh vào Flow qua hidden file input (Flow có 1 input[type="file"][accept="image/*"] ẩn
-// cho nút "+ Thêm nội dung nghe nhìn"). Playwright's setInputFiles dispatch native change event
-// mà React state listener của Flow nhận được — synthetic ClipboardEvent / DragEvent KHÔNG work.
+// Upload ảnh vào Flow qua CLIPBOARD PASTE (Cmd/Ctrl+V).
+// File input cách cũ flaky (input[type=file] không always attach), và setInputFiles đôi khi
+// route ảnh vào project gallery thay vì composer. Paste thật → Flow nhận đúng như user paste,
+// route vào composer đang focus. Yêu cầu context có permissions clipboard-read/clipboard-write.
 async function pasteAssetIntoFlow(page: Page, imagePath: string): Promise<void> {
-  const fileInput = page.locator('input[type="file"][accept*="image"]').first()
-  await fileInput.waitFor({ state: 'attached', timeout: 10000 })
-  await fileInput.setInputFiles(imagePath)
+  const buf = await fs.readFile(imagePath)
+  const base64 = buf.toString('base64')
+  const ext = path.extname(imagePath).slice(1).toLowerCase() || 'png'
+  const srcMime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+    : ext === 'webp' ? 'image/webp'
+    : 'image/png'
+
+  const tb = page.locator('[role="textbox"][contenteditable="true"][data-slate-editor="true"]').last()
+  await tb.waitFor({ state: 'visible', timeout: 15000 })
+  await tb.scrollIntoViewIfNeeded().catch(() => {})
+  await tb.click({ timeout: 5000 })
+  await page.waitForTimeout(300)
+
+  // navigator.clipboard.write chỉ guarantee image/png. JPEG/WebP → re-encode qua canvas.
+  await page.evaluate(async ({ b64, srcMime }) => {
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    let pngBlob: Blob
+    if (srcMime === 'image/png') {
+      pngBlob = new Blob([bytes], { type: 'image/png' })
+    } else {
+      const srcBlob = new Blob([bytes], { type: srcMime })
+      const url = URL.createObjectURL(srcBlob)
+      try {
+        const img = await new Promise<HTMLImageElement>((res, rej) => {
+          const el = new Image()
+          el.onload = () => res(el)
+          el.onerror = () => rej(new Error('decode-fail'))
+          el.src = url
+        })
+        const canvas = document.createElement('canvas')
+        canvas.width = img.naturalWidth
+        canvas.height = img.naturalHeight
+        canvas.getContext('2d')!.drawImage(img, 0, 0)
+        pngBlob = await new Promise<Blob>((res, rej) => {
+          canvas.toBlob(b => b ? res(b) : rej(new Error('encode-fail')), 'image/png')
+        })
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+    }
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })])
+  }, { b64: base64, srcMime })
+
+  await tb.click({ timeout: 3000 }).catch(() => {})
+  await page.waitForTimeout(150)
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V')
 }
 
-// Chờ asset thumbnail thật sự load xong trong composer.
-// Cần baseline URL trước upload để skip avatar / flower-placeholder / ảnh sẵn có.
-// Ready = có 1 img MỚI (không trong baseline), size > 30px, naturalWidth > 0, complete, AND
-// không còn progressbar visible (upload đang chạy).
+// Chờ asset thumbnail load vào COMPOSER (không phải project gallery).
+// Scope bằng geo: tìm img có tâm nằm trong ~500x300 quanh textbox (Flow không có <form> ancestor
+// nên closest('form') fail; geo-scope robust hơn). Thumbnail ready khi src bắt đầu là blob/data/http
+// + rendered ≥30px + stable qua 2 tick (đợi Flow đổi src từ blob → media.getMediaUrlRedirect sau upload).
+// baselineSrcs không còn cần — giữ signature để không phải đổi callers.
 async function waitForFlowAssetReady(
   page: Page,
-  baselineSrcs: string[],
+  _baselineSrcs: string[],
   timeoutMs = 120000
 ): Promise<boolean> {
   const start = Date.now()
+  let stableCount = 0
+  let lastSrc: string | null = null
   while (Date.now() - start < timeoutMs) {
     if (page.isClosed()) return false
-    const state = await page.evaluate((baseline: string[]) => {
-      const imgs = Array.from(document.querySelectorAll('img')) as HTMLImageElement[]
-      const newReady = imgs.filter(img => {
-        const src = img.src || ''
-        if (!src) return false
-        if (baseline.includes(src)) return false
-        if (src.includes('avatar')) return false
-        if (src.includes('googleusercontent.com/a/')) return false
-        if (src.includes('flower-placeholder')) return false
+    const state = await page.evaluate(() => {
+      const tb = document.querySelector('[role="textbox"][contenteditable="true"][data-slate-editor="true"]') as HTMLElement | null
+      if (!tb) return { ok: false, thumbSrc: null as string | null }
+      const tbR = tb.getBoundingClientRect()
+      const tcx = tbR.left + tbR.width / 2
+      const tcy = tbR.top + tbR.height / 2
+      const nearby = (Array.from(document.querySelectorAll('img')) as HTMLImageElement[]).filter(img => {
         const r = img.getBoundingClientRect()
-        if (r.width < 30 || r.height < 30) return false
-        if (!img.complete || img.naturalWidth <= 0) return false
-        return true
-      }).length
-
-      const progressbars = Array.from(document.querySelectorAll('[role="progressbar"]')) as HTMLElement[]
-      const hasProgress = progressbars.some(p => {
-        const r = p.getBoundingClientRect()
-        return r.width > 0 && r.height > 0
+        if (!r.width || !r.height) return false
+        const cx = r.left + r.width / 2
+        const cy = r.top + r.height / 2
+        return Math.abs(cx - tcx) < 500 && Math.abs(cy - tcy) < 300
       })
-      return { newReady, hasProgress }
-    }, baselineSrcs).catch(() => ({ newReady: 0, hasProgress: false }))
+      const thumb = nearby.find(img => {
+        const src = img.src || ''
+        if (!src || src.includes('avatar') || src.includes('googleusercontent.com/a/')) return false
+        if (!img.complete || img.naturalWidth < 10) return false
+        if (!(src.startsWith('blob:') || src.startsWith('data:') || src.startsWith('http'))) return false
+        const r = img.getBoundingClientRect()
+        return r.width >= 30 && r.height >= 30
+      })
+      return { ok: !!thumb, thumbSrc: thumb?.src || null }
+    }).catch(() => ({ ok: false, thumbSrc: null as string | null }))
 
-    if (state.newReady >= 1 && !state.hasProgress) return true
+    if (state.ok) {
+      if (state.thumbSrc === lastSrc) stableCount++
+      else { stableCount = 1; lastSrc = state.thumbSrc }
+      if (stableCount >= 2) return true
+    } else {
+      stableCount = 0
+      lastSrc = null
+    }
     await page.waitForTimeout(1000)
   }
   return false
@@ -1874,6 +1931,7 @@ async function processImageInBrowser(
       headless: false,
       viewport: { width: browserWidth, height: browserHeight },
       ignoreDefaultArgs: ['--enable-automation'],
+      permissions: ['clipboard-read', 'clipboard-write'],
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -1889,6 +1947,8 @@ async function processImageInBrowser(
         `--window-position=${pos.x},${pos.y}`
       ]
     })
+    // Ép permission clipboard cho labs.google (pasteAssetIntoFlow dùng navigator.clipboard.write)
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: 'https://labs.google' }).catch(() => {})
     
     // Tạo 2 tabs trong browser
     pageA = await context.newPage()
