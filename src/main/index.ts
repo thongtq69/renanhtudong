@@ -860,31 +860,36 @@ async function waitForImageReady(
 }
 
 // ========== HÀM EXTRACT PROMPT ==========
+// Ưu tiên: marker ===PROMPT_START===/===PROMPT_END=== (bot inject trong wrappedPrompt gửi ChatGPT).
+// Fallback cũ: <pre> cuối / code block ```...```.
 async function extractPrompt(page: Page, log: (msg: string) => void): Promise<string> {
   try {
     const lastMsg = page.locator('[data-message-author-role="assistant"]').last()
+    const fullText = await lastMsg.innerText()
+
+    // 1. Marker match — non-greedy để lấy đúng cặp đầu tiên
+    const markerMatch = fullText.match(/===PROMPT_START===\s*\n?([\s\S]*?)\n?===PROMPT_END===/)
+    if (markerMatch && markerMatch[1].trim().length >= 20) {
+      return markerMatch[1].trim()
+    }
+
+    // 2. Fallback: <pre> cuối
     const preElement = lastMsg.locator('pre').last()
-    
     let extractedPrompt = ''
-    
     if (await preElement.count() > 0) {
       extractedPrompt = await preElement.innerText()
+    } else if (fullText.includes('```')) {
+      // 3. Fallback: code block ```...```
+      const blocks = fullText.split('```')
+      extractedPrompt = blocks[blocks.length - 2] || ''
+      extractedPrompt = extractedPrompt.replace(/^[a-zA-Z]+\n/, '')
     } else {
-      let fullText = await lastMsg.innerText()
-      if (fullText.includes('```')) {
-        const blocks = fullText.split('```')
-        extractedPrompt = blocks[blocks.length - 2]
-        extractedPrompt = extractedPrompt.replace(/^[a-zA-Z]+\n/, '')
-      } else {
-        extractedPrompt = fullText
-      }
+      extractedPrompt = fullText
     }
-    
-    extractedPrompt = extractedPrompt.replace(/Copy code/gi, '').trim()
-    return extractedPrompt
-    
+
+    return extractedPrompt.replace(/Copy code/gi, '').trim()
   } catch (e) {
-    log(`❌ Lỗi extract prompt: ${e.message}`)
+    log(`❌ Lỗi extract prompt: ${(e as Error).message}`)
     return ''
   }
 }
@@ -1974,7 +1979,9 @@ async function processImageInBrowser(
 
     log(`⌨️ Browser ${imageIndex + 1}: Tab A - Gửi prompt phân tích...`)
     await ensureNoPopup(pageA)
-    await pageA.locator('#prompt-textarea').fill(promptTemplate)
+    // Ràng buộc ChatGPT wrap output giữa marker rõ ràng, extractPrompt bắt chuỗi này đầu tiên.
+    const wrappedPrompt = `${promptTemplate}\n\n---\nQUAN TRỌNG: Trả về DUY NHẤT prompt cuối cùng, đặt giữa 2 marker dưới đây trên 2 dòng riêng. KHÔNG giải thích, KHÔNG thêm markdown, KHÔNG lặp lại marker.\n===PROMPT_START===\n<prompt ở đây>\n===PROMPT_END===`
+    await pageA.locator('#prompt-textarea').fill(wrappedPrompt)
     await pageA.waitForTimeout(500)
     await ensureNoPopup(pageA)
 
