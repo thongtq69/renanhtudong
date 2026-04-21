@@ -1979,9 +1979,7 @@ async function processImageInBrowser(
 
     log(`⌨️ Browser ${imageIndex + 1}: Tab A - Gửi prompt phân tích...`)
     await ensureNoPopup(pageA)
-    // Ràng buộc ChatGPT wrap output giữa marker rõ ràng, extractPrompt bắt chuỗi này đầu tiên.
-    const wrappedPrompt = `${promptTemplate}\n\n---\nQUAN TRỌNG: Trả về DUY NHẤT prompt cuối cùng, đặt giữa 2 marker dưới đây trên 2 dòng riêng. KHÔNG giải thích, KHÔNG thêm markdown, KHÔNG lặp lại marker.\n===PROMPT_START===\n<prompt ở đây>\n===PROMPT_END===`
-    await pageA.locator('#prompt-textarea').fill(wrappedPrompt)
+    await pageA.locator('#prompt-textarea').fill(promptTemplate)
     await pageA.waitForTimeout(500)
     await ensureNoPopup(pageA)
 
