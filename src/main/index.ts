@@ -1872,6 +1872,26 @@ const getBrowserProfileDir = (index: number): string => {
   return path.join(app.getPath('userData'), `browser-profile-${index}`)
 }
 
+// Clone profile-0 sang profile-N nếu profile-N chưa có session.
+// Gọi runtime để user chọn concurrency > 5 không phải copy login thủ công.
+const PROFILE_SKIP_FILES = new Set([
+  'RunningChromeVersion', 'SingletonLock', 'SingletonCookie', 'SingletonSocket'
+])
+async function ensureProfileCloned(index: number): Promise<string> {
+  const dir = getBrowserProfileDir(index)
+  if (index === 0) return dir
+  // Heuristic: profile coi là đã setup nếu có thư mục Default (Chromium structure)
+  if (await fs.pathExists(path.join(dir, 'Default'))) return dir
+  const src = getBrowserProfileDir(0)
+  if (!(await fs.pathExists(src))) return dir
+  await fs.remove(dir).catch(() => {})
+  await fs.copy(src, dir, {
+    filter: (srcPath) => !PROFILE_SKIP_FILES.has(path.basename(srcPath)),
+    dereference: false
+  })
+  return dir
+}
+
 async function processImageInBrowser(
   imagePath: string,
   imageIndex: number,
@@ -1914,8 +1934,8 @@ async function processImageInBrowser(
     
     const pos = positions[imageIndex] || { x: imageIndex * 100, y: imageIndex * 100 }
     
-    // Thư mục profile cố định cho browser này
-    const profileDir = getBrowserProfileDir(imageIndex)
+    // Thư mục profile cố định cho browser này (auto-clone từ profile-0 nếu concurrency > 5)
+    const profileDir = await ensureProfileCloned(imageIndex)
     await fs.ensureDir(profileDir)
 
     // Clean lock files còn sót từ lần crash/force-quit trước — nếu không Chrome sẽ "Mở trong phiên hiện tại"
@@ -2256,6 +2276,7 @@ ipcMain.handle('start-automation', async (event, config) => {
       waitTimeUpload,
       waitTimeGenerate,
       maxRetry,
+      concurrency,
       renderMode: rawRenderMode
     } = config
 
@@ -2263,7 +2284,8 @@ ipcMain.handle('start-automation', async (event, config) => {
       rawRenderMode === 'flow-image' || rawRenderMode === 'flow-video' ? rawRenderMode : 'chatgpt'
 
     const finalOutputFolder = outputFolder || path.join(inputFolder, 'AI')
-    const CONCURRENCY = 5
+    const parsedConc = parseInt(concurrency)
+    const CONCURRENCY = Math.max(1, Math.min(Number.isFinite(parsedConc) ? parsedConc : 5, 20))
     const retryCap = Math.max(0, parseInt(maxRetry) || 3)
     const modeLabel =
       renderMode === 'flow-image' ? 'Flow (ảnh)' : renderMode === 'flow-video' ? 'Flow (video)' : 'ChatGPT'

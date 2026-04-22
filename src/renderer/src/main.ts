@@ -10,6 +10,7 @@ const promptTemplate = document.getElementById('prompt-template') as HTMLTextAre
 const waitUpload = document.getElementById('wait-upload') as HTMLInputElement
 const waitGenerate = document.getElementById('wait-generate') as HTMLInputElement
 const maxRetry = document.getElementById('max-retry') as HTMLInputElement
+const concurrencyInput = document.getElementById('concurrency') as HTMLInputElement
 const renderMode = document.getElementById('render-mode') as HTMLSelectElement
 
 const btnInput = document.getElementById('btn-input') as HTMLButtonElement
@@ -54,6 +55,7 @@ waitUpload.value = savedConfig.waitTimeUpload || 5000
 const savedWaitGen = parseInt(savedConfig.waitTimeGenerate) || 180000
 waitGenerate.value = String(Math.max(savedWaitGen, 120000))
 maxRetry.value = savedConfig.maxRetry || 3
+concurrencyInput.value = savedConfig.concurrency || 5
 renderMode.value = savedConfig.renderMode || 'chatgpt'
 coverImage.value = savedConfig.coverImage || ''
 logoImage.value = savedConfig.logoImage || ''
@@ -79,6 +81,7 @@ function saveConfig() {
     waitTimeUpload: parseInt(waitUpload.value),
     waitTimeGenerate: parseInt(waitGenerate.value),
     maxRetry: parseInt(maxRetry.value),
+    concurrency: parseInt(concurrencyInput.value),
     renderMode: renderMode.value,
     coverImage: coverImage.value,
     logoImage: logoImage.value,
